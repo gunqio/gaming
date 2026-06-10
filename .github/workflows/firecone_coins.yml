@@ -11,7 +11,7 @@ jobs:
       - name: 📥 下载私库脚本
         uses: actions/checkout@v4
         with:
-          repository: ${{ github.repository_owner }}/Firecone-Coins-Private
+          repository: gunqio/zhiyong
           token: ${{ secrets.PRIVATE_REPO_TOKEN }}
           path: private
 
@@ -38,7 +38,7 @@ jobs:
           seleniumbase install chromedriver
 
       - name: 🛡️ 启动 GOST 代理转发
-        if: ${{ env.GOST_PROXY != '' }}
+        if: ${{ secrets.GOST_PROXY != '' }}
         env:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
         run: |
