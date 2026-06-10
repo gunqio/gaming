@@ -1,389 +1,591 @@
-import os, re, time, json, random, logging
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
+#!/usr/bin/python3.12
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+import sys
+import re
+import time
+import random
+import string
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── 配置 ─────────────────────────────────────────────
-# 你的 gaming4free server 页面 URL，格式如 https://g4f.gg/my-mc-server
-SERVER_URL = os.environ["G4F_URL"]
+from cloakbrowser import launch
 
-WXPUSHER_TOKEN = os.environ.get("APP_TOKEN", "")
-WXPUSHER_UID   = os.environ.get("WX_PUSHER_UID", "")
+SERVERS = [
+    {"url": "https://g4f.gg/deku", "name": "Deku"},
+    {"url": "https://g4f.gg/rena", "name": "Rena"},
+]
 
-SCREENSHOT_DIR = Path("./screenshots")
-SCREENSHOT_DIR.mkdir(exist_ok=True)
 
-# ── WxPusher ─────────────────────────────────────────
-def wxpush(content: str):
-    if not WXPUSHER_TOKEN or not WXPUSHER_UID:
-        log.warning("WxPusher 未配置，跳过推送")
-        return
-    import urllib.request
-    payload = json.dumps({
-        "appToken": WXPUSHER_TOKEN,
-        "content":  content,
-        "contentType": 1,
-        "uids": [WXPUSHER_UID],
-    }).encode()
-    try:
-        req = urllib.request.Request(
-            "https://wxpusher.zjiecode.com/api/send/message",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+def random_voter_name():
+    return (
+        random.choice(string.ascii_uppercase)
+        + ''.join(
+            random.choices(
+                string.ascii_lowercase,
+                k=4
+            )
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            result = json.loads(resp.read())
-            if result.get("success"):
-                log.info("📨 WxPusher 推送成功")
-            else:
-                log.warning(f"📨 WxPusher 失败: {result}")
-    except Exception as e:
-        log.warning(f"📨 WxPusher 异常: {e}")
+    )
 
-# ── 工具 ─────────────────────────────────────────────
-def take_screenshot(page, name: str):
-    try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        path = str(SCREENSHOT_DIR / f"{ts}_{name}.png")
-        page.screenshot(path=path, full_page=False)
-        log.info(f"📸 截图: {path}")
-    except Exception as e:
-        log.warning(f"截图失败: {e}")
 
-def get_text(page) -> str:
-    try:
-        return page.inner_text("body") or ""
-    except:
-        return ""
+def _parse_time(s):
+    if s == "N/A" or not s:
+        return None
 
-def human_move_and_click(page, element):
-    """用 CloakBrowser 人类鼠标轨迹点击元素"""
     try:
-        box = element.bounding_box()
-        if not box:
-            log.warning("元素 bounding_box 为空，fallback JS click")
-            element.evaluate("el => el.click()")
-            return
-        # 在元素中心附近随机落点（±20% 抖动）
-        cx = box["x"] + box["width"]  * (0.4 + random.random() * 0.2)
-        cy = box["y"] + box["height"] * (0.4 + random.random() * 0.2)
-        log.info(f"🖱️  human_move_and_click → ({cx:.0f}, {cy:.0f})")
-        page.mouse.move(cx, cy)
-        time.sleep(random.uniform(0.08, 0.18))
-        page.mouse.click(cx, cy)
-    except Exception as e:
-        log.warning(f"human_move_and_click 失败，JS fallback: {e}")
-        try:
-            element.evaluate("el => el.click()")
-        except:
-            pass
+        parts = s.strip().split(":")
 
-# ── 读取当前剩余时间 ─────────────────────────────────
-def read_remaining(page) -> str | None:
-    """读取页面上 'SERVER TIME REMAINING' 下方的 HH:MM:SS"""
-    try:
-        el = page.locator(".timer, [class*='timer'], [class*='countdown']").first
-        txt = el.inner_text(timeout=3000).strip()
-        if re.match(r'\d+:\d{2}:\d{2}', txt):
-            return txt
+        if len(parts) == 3:
+            return (
+                int(parts[0]) * 3600
+                + int(parts[1]) * 60
+                + int(parts[2])
+            )
+
+        if len(parts) == 2:
+            return (
+                int(parts[0]) * 60
+                + int(parts[1])
+            )
+
     except:
         pass
-    # 正则从全文找
-    body = get_text(page)
-    m = re.search(r'(\d{1,3}:\d{2}:\d{2})', body)
-    return m.group(1) if m else None
 
-def read_expiry_utc(page) -> str | None:
-    """读取 'expires Jun 9, 2026 at 00:33 UTC' 字样"""
-    body = get_text(page)
-    m = re.search(r'expires\s+(.+?UTC)', body)
-    return m.group(1).strip() if m else None
+    return None
 
-# ── 点击 +ADD 90 MIN 按钮 ────────────────────────────
-def click_add_90_btn(page) -> bool:
-    """找到并点击 '+ ADD 90 MIN' 按钮，触发 CF 验证弹窗"""
-    # 先等待按钮出现
-    selectors = [
-        "button.vote-btn",
-        "button[onclick*='openCaptchaModal']",
-        "button:has-text('ADD 90 MIN')",
-        ".vote-btn",
-    ]
-    btn = None
-    for sel in selectors:
+
+def _extract_remaining_time(text):
+
+    m = re.search(
+        r"SERVER TIME REMAINING\s*([\d:]+)",
+        text,
+        re.I
+    )
+
+    return m.group(1) if m else "N/A"
+
+
+def _safe_goto(page, url, name):
+
+    for attempt in range(3):
+
         try:
-            loc = page.locator(sel).first
-            if loc.is_visible(timeout=4000):
-                btn = loc
-                log.info(f"✅ 找到 ADD 90 MIN 按钮: {sel}")
-                break
-        except:
-            pass
 
-    if btn is None:
-        log.error("找不到 '+ ADD 90 MIN' 按钮")
-        take_screenshot(page, "btn_not_found")
-        return False
+            page.goto(
+                url,
+                wait_until="domcontentloaded",
+                timeout=30000
+            )
 
-    human_move_and_click(page, btn)
-    log.info("已点击 '+ ADD 90 MIN'，等待 CF 验证弹窗...")
-    return True
+            #
+            # 给页面3秒渲染投票表单
+            #
+            page.wait_for_timeout(3000)
 
-# ── 处理 Cloudflare Turnstile 弹窗（Zytrano 同款坐标点击逻辑）──
-def handle_cf_turnstile(page, timeout=30) -> bool:
-    """
-    gaming4free 验证链路：
-      #captcha-modal → iframe (challenges.cloudflare.com) → closed shadow-root → checkbox
-    关键：不用选择器穿透 shadow-root，直接用
-      cf_frame.frame_element().bounding_box() 拿 iframe 在 page 坐标系的位置，
-      然后 page.mouse.click(x+25, y+h/2) 点左侧 checkbox 区域。
-    """
+            #
+            # 强行停止所有剩余加载（广告等）
+            #
+            page.evaluate("window.stop()")
 
-    def dump_frames(label: str):
-        try:
-            frames = page.frames
-            log.info(f"[{label}] 共 {len(frames)} 个 frame：")
-            for i, f in enumerate(frames):
-                log.info(f"  [{i}] {(f.url or 'about:blank')[:120]}")
+            print(
+                f"[{name}] 页面已加载，已停止广告资源",
+                file=sys.stderr
+            )
+
+            return
+
         except Exception as e:
-            log.warning(f"[{label}] dump_frames 失败: {e}")
 
-    # ── 等弹窗出现 ───────────────────────────────────────────
-    log.info("等待 #captcha-modal 出现...")
+            msg = str(e)
+
+            if any(x in msg for x in (
+                "ERR_NETWORK_CHANGED",
+                "ERR_CONNECTION_RESET",
+                "ERR_TIMED_OUT",
+            )):
+
+                print(
+                    f"[{name}] 网络异常({attempt+1}/3): {msg}",
+                    file=sys.stderr
+                )
+
+                page.wait_for_timeout(5000)
+
+                continue
+
+            raise
+
+    raise RuntimeError(
+        f"{name} 页面加载失败"
+    )
+
+
+def _click_turnstile(page, name):
+
     try:
-        page.wait_for_selector("#captcha-modal", state="visible", timeout=20000)
-        log.info("✅ #captcha-modal 出现")
-    except Exception as e:
-        log.error(f"captcha-modal 未出现: {e}")
-        take_screenshot(page, "modal_not_found")
-        return False
 
-    take_screenshot(page, "cf_modal_appeared")
+        iframe = page.locator(
+            'iframe[src*="turnstile"]'
+        ).first
 
-    # ── 阶段1：等静默通过（最多 10s）──────────────────────────
-    log.info("【阶段1】等待 Turnstile 静默通过...")
-    for i in range(20):
-        if "minutes added" in get_text(page).lower():
-            log.info(f"✅ 静默通过（{i * 0.5:.1f}s）")
-            return True
-        time.sleep(0.5)
-
-    # ── 阶段2：枚举 frames 找 CF iframe（最多 8s）──────────────
-    log.info("【阶段2】枚举 frames 查找 Turnstile iframe...")
-    dump_frames("阶段2")
-    cf_frame = None
-    for tick in range(16):
-        for f in page.frames:
-            if "challenges.cloudflare.com" in (f.url or ""):
-                cf_frame = f
-                break
-        if cf_frame:
-            log.info(f"✅ 找到 CF frame（{tick * 0.5:.1f}s）: {cf_frame.url[:100]}")
-            break
-        time.sleep(0.5)
-
-    if cf_frame is None:
-        log.warning("【阶段2】未找到 CF frame，降级：用 iframe src 坐标点击")
-        dump_frames("降级")
-        take_screenshot(page, "no_cf_frame")
-        try:
-            iframe_el = page.locator('iframe[src*="challenges.cloudflare.com"]').first
-            box = iframe_el.bounding_box()
-            log.info(f"  降级 iframe bounding_box={box}")
-            if box:
-                x = box["x"] + 25
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y)
-                time.sleep(random.uniform(0.2, 0.4))
-                page.mouse.click(x, y)
-                log.info(f"  ✅ 降级坐标点击 ({x:.0f}, {y:.0f})")
-            else:
-                log.error("  降级 bounding_box 为 None")
-                return False
-        except Exception as fe:
-            log.error(f"  降级点击失败: {fe}")
-            return False
-    else:
-        # ── 阶段3：frame_element().bounding_box() → page.mouse.click ──
-        time.sleep(1)  # 等 iframe 内部 JS 初始化
-        log.info("【阶段3】通过 frame_element bounding_box 坐标点击 checkbox...")
-        try:
-            frame_el = cf_frame.frame_element()
-            box = frame_el.bounding_box()
-            log.info(f"  frame bounding_box={box}")
-            if box:
-                x = box["x"] + 25                   # checkbox 在 iframe 左侧 ~25px
-                y = box["y"] + box["height"] / 2
-                page.mouse.move(x, y)
-                time.sleep(random.uniform(0.15, 0.35))
-                page.mouse.click(x, y)
-                log.info(f"  ✅ 坐标点击 ({x:.0f}, {y:.0f})")
-            else:
-                log.error("  bounding_box 为 None，iframe 可能不可见")
-                take_screenshot(page, "frame_bbox_none")
-                return False
-        except Exception as e:
-            log.error(f"  坐标点击失败: {e}")
-            take_screenshot(page, "frame_click_error")
+        if iframe.count() == 0:
             return False
 
-    take_screenshot(page, "cf_after_click")
+        box = iframe.bounding_box()
 
-    # ── 阶段4：等待成功（最多 30s）────────────────────────────
-    # 验证通过后表单自动 POST 提交，页面刷新，banner 出现，
-    # 此时 cf-turnstile-response input 已消失，不能用 token 判断。
-    # 改为：检测 "minutes added" banner 或 modal 消失二选一。
-    log.info("【阶段4】等待续期成功（banner 出现 或 modal 消失）...")
-    for i in range(timeout * 2):
-        try:
-            body = get_text(page)
-            if "minutes added" in body.lower():
-                log.info(f"✅ 续期成功 banner 出现（{i * 0.5:.1f}s）")
-                take_screenshot(page, "cf_success")
-                return True
-            # modal 消失也视为通过（表单已提交）
-            modal_visible = page.locator("#captcha-modal").is_visible(timeout=200)
-            if not modal_visible:
-                log.info(f"✅ captcha-modal 已消失（{i * 0.5:.1f}s），视为成功")
-                take_screenshot(page, "cf_success")
-                return True
-        except Exception:
-            # locator 抛异常说明 modal 已不在 DOM，表单已提交
-            log.info(f"✅ modal 已从 DOM 移除（{i * 0.5:.1f}s）")
-            take_screenshot(page, "cf_success")
-            return True
+        if not box:
+            return False
 
-        if i % 10 == 0 and i > 0:
-            log.info(f"  等待中... {i * 0.5:.0f}s")
-            take_screenshot(page, f"cf_wait_{i}")
-        time.sleep(0.5)
+        page.mouse.click(
+            box["x"] + box["width"] / 2,
+            box["y"] + box["height"] / 2
+        )
 
-    log.error("【阶段4】等待超时（30s）")
-    take_screenshot(page, "cf_timeout")
-    return False
+        print(
+            f"[{name}] 已尝试点击 Turnstile",
+            file=sys.stderr
+        )
 
-# ── 主流程 ───────────────────────────────────────────
-def add_90_min(page) -> bool:
-    """完整执行一次 +90 min 流程，返回是否成功"""
-    # 1. 打开页面
-    log.info(f"打开页面: {SERVER_URL}")
-    try:
-        page.goto(SERVER_URL, timeout=30000, wait_until="domcontentloaded")
+        return True
+
     except Exception as e:
-        log.warning(f"goto 超时: {e}")
-    time.sleep(2)
-    take_screenshot(page, "01_page_loaded")
 
-    # 读取续期前的到期时间
-    before_expiry = read_expiry_utc(page)
-    before_remain = read_remaining(page)
-    log.info(f"续期前 → 剩余: {before_remain}, 到期: {before_expiry}")
+        print(
+            f"[{name}] Turnstile点击失败: {e}",
+            file=sys.stderr
+        )
 
-    # 2. 点击 +ADD 90 MIN
-    if not click_add_90_btn(page):
-        return False
-    time.sleep(2)
-
-    # 3. 处理 CF Turnstile（token 写入即视为验证通过，表单会自动提交）
-    if not handle_cf_turnstile(page):
         return False
 
-    # 4. 等待成功 banner
-    log.info("等待成功 banner...")
-    success = False
-    for i in range(20):
-        body = get_text(page)
-        if "minutes added" in body.lower():
-            log.info(f"✅ 成功 banner 出现（{i}s）")
-            success = True
-            break
-        time.sleep(1)
 
-    take_screenshot(page, "02_after_renew")
+def _run_single_attempt(url, name):
 
-    after_expiry = read_expiry_utc(page)
-    after_remain = read_remaining(page)
-    log.info(f"续期后 → 剩余: {after_remain}, 到期: {after_expiry}")
-
-    return success or (after_expiry and after_expiry != before_expiry)
-
-def main():
-    from cloakbrowser import launch
-
-    log.info("启动 CloakBrowser...")
     browser = launch(
         headless=False,
         humanize=True,
+        geoip=True,
+        proxy="socks5://127.0.0.1:7928"
     )
-    page = browser.new_page()
-    page.set_viewport_size({"width": 1280, "height": 800})
-
-    # 读取续期前信息（先导航一次）
-    before_expiry = None
-    before_remain = None
-    after_expiry  = None
-    after_remain  = None
-    success = False
 
     try:
-        # 先访问一次读当前时间
+
+        page = browser.new_page()
+
+        voter_name = random_voter_name()
+
+        print(
+            f"[{name}] Voter: {voter_name}",
+            file=sys.stderr
+        )
+
+        vote_result = {
+            "request_sent": False,
+            "status": None,
+        }
+
+        def on_request(req):
+
+            try:
+
+                if (
+                    "/vote" in req.url
+                    and req.method == "POST"
+                ):
+                    vote_result["request_sent"] = True
+
+                    print(
+                        f"[{name}] Vote POST Sent",
+                        file=sys.stderr
+                    )
+
+            except:
+                pass
+
+        def on_response(resp):
+
+            try:
+
+                if "/vote" in resp.url:
+
+                    vote_result["status"] = resp.status
+
+                    print(
+                        f"[{name}] Vote Response: {resp.status}",
+                        file=sys.stderr
+                    )
+
+            except:
+                pass
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        page.on(
+            "pageerror",
+            lambda err: print(
+                f"[{name}] page_error: {err}",
+                file=sys.stderr
+            )
+        )
+
+        _safe_goto(
+            page,
+            url,
+            name
+        )
+
+        page.wait_for_timeout(3000)
+
+        body = page.evaluate(
+            "document.body?.innerText || ''"
+        )
+
+        if "Come back in" in body:
+
+            return (
+                False,
+                f"⏳ {name} 冷却中",
+                None
+            )
+
+        before_str = _extract_remaining_time(
+            body
+        )
+
+        before_secs = _parse_time(
+            before_str
+        )
+
+        print(
+            f"[{name}] Before: {before_str}",
+            file=sys.stderr
+        )
+
+        page.wait_for_selector(
+            'input[name="voter_name"]',
+            timeout=10000
+        )
+
+        page.fill(
+            'input[name="voter_name"]',
+            voter_name
+        )
+
+        page.locator(
+            "button.vote-btn"
+        ).click(force=True)
+
+        print(
+            f"[{name}] 点击 Vote",
+            file=sys.stderr
+        )
+
+        success_detected = False
+        after_str = "N/A"
+
+        success_patterns = [
+            "minutes added",
+            "minute added",
+            "thanks for supporting the server",
+        ]
+
+        #
+        # 主等待阶段（30秒）
+        #
+        for _ in range(15):
+
+            page.wait_for_timeout(2000)
+
+            try:
+
+                current_text = page.evaluate(
+                    "document.body?.innerText || ''"
+                )
+
+            except:
+                continue
+
+            lower_text = current_text.lower()
+
+            after_str = _extract_remaining_time(
+                current_text
+            )
+
+            for p in success_patterns:
+
+                if p in lower_text:
+
+                    print(
+                        f"[{name}] Success Pattern: {p}",
+                        file=sys.stderr
+                    )
+
+                    success_detected = True
+                    break
+
+            if success_detected:
+                break
+
+        #
+        # Turnstile补救
+        #
+        if (
+            not success_detected
+            and vote_result["status"] is None
+        ):
+
+            print(
+                f"[{name}] Turnstile超时，尝试触发",
+                file=sys.stderr
+            )
+
+            _click_turnstile(
+                page,
+                name
+            )
+
+            for _ in range(8):
+
+                page.wait_for_timeout(2000)
+
+                try:
+
+                    current_text = page.evaluate(
+                        "document.body?.innerText || ''"
+                    )
+
+                except:
+                    continue
+
+                lower_text = current_text.lower()
+
+                after_str = _extract_remaining_time(
+                    current_text
+                )
+
+                for p in success_patterns:
+
+                    if p in lower_text:
+
+                        print(
+                            f"[{name}] Success Pattern: {p}",
+                            file=sys.stderr
+                        )
+
+                        success_detected = True
+                        break
+
+                if (
+                    success_detected
+                    or vote_result["status"] == 302
+                ):
+                    break
+
         try:
-            page.goto(SERVER_URL, timeout=30000, wait_until="domcontentloaded")
-            time.sleep(2)
-            before_expiry = read_expiry_utc(page)
-            before_remain = read_remaining(page)
-            log.info(f"当前状态 → 剩余: {before_remain}, 到期: {before_expiry}")
+
+            final_text = page.evaluate(
+                "document.body?.innerText || ''"
+            )
+
+            after_str = _extract_remaining_time(
+                final_text
+            )
+
+        except:
+            pass
+
+        after_secs = _parse_time(
+            after_str
+        )
+
+        print(
+            f"[{name}] After: {after_str}",
+            file=sys.stderr
+        )
+
+        #
+        # 最可靠成功判断
+        #
+        if (
+            vote_result["status"] == 302
+            and before_secs
+            and after_secs
+        ):
+
+            diff = (
+                after_secs - before_secs
+            ) // 60
+
+            return (
+                True,
+                f"✅ {name} 续期成功 (+{diff}分钟) 剩余:{after_str}",
+                after_str
+            )
+
+        if success_detected:
+
+            return (
+                True,
+                f"✅ {name} 检测到成功提示",
+                after_str
+            )
+
+        if (
+            before_secs
+            and after_secs
+            and after_secs > before_secs + 3000
+        ):
+
+            diff = (
+                after_secs - before_secs
+            ) // 60
+
+            return (
+                True,
+                f"✅ {name} 剩余时间增加 {diff} 分钟",
+                after_str
+            )
+
+        return (
+            False,
+            f"❌ {name} 未检测到续期成功",
+            after_str
+        )
+
+    finally:
+
+        try:
+            browser.close()
+        except:
+            pass
+
+
+def renew_server(url, name):
+
+    for attempt in range(2):
+
+        try:
+
+            success, msg, tl = _run_single_attempt(
+                url,
+                name
+            )
+
+            if success:
+                return success, msg, tl
+
+            if "冷却中" in msg:
+                return success, msg, tl
+
+            print(
+                f"[{name}] 重试 #{attempt+1}",
+                file=sys.stderr
+            )
+
         except Exception as e:
-            log.warning(f"初次读取失败: {e}")
 
-        success = add_90_min(page)
+            print(
+                f"[{name}] 异常: {e}",
+                file=sys.stderr
+            )
 
-        if success:
+            if attempt == 1:
+
+                return (
+                    False,
+                    f"❌ {name} 错误: {e}",
+                    None
+                )
+
+        if attempt < 1:
             time.sleep(3)
-            after_expiry = read_expiry_utc(page)
-            after_remain = read_remaining(page)
+
+    return (
+        False,
+        f"❌ {name} 续期失败",
+        None
+    )
+
+
+def main():
+
+    # ===== 浏览器验证代理 IP =====
+    try:
+        print("\n===== 验证代理 IP =====", file=sys.stderr)
+        check_browser = launch(
+            headless=False,
+            humanize=True,
+            proxy="socks5://127.0.0.1:7928"
+        )
+        check_page = check_browser.new_page()
+        check_page.goto(
+            "https://ip.sb",
+            wait_until="domcontentloaded",
+            timeout=30000
+        )
+        
+        check_page.wait_for_timeout(3000)
+        time.sleep(5)
+        check_page.evaluate("window.stop()")
+        body_text = check_page.evaluate(
+            "document.body?.innerText || ''"
+        )
+        print(body_text, file=sys.stderr)
+
+        ip_match = re.search(
+            r"(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})",
+            body_text
+        )
+
+        if ip_match:
+            print(
+                f"✅ 浏览器代理已连接，出站 IP: {ip_match.group(1)}",
+                file=sys.stderr
+            )
+        else:
+            print(
+                "⚠️ 未能识别出站 IP",
+                file=sys.stderr
+            )
+
+        check_browser.close()
+        print("===== 验证完成 =====\n", file=sys.stderr)
 
     except Exception as e:
-        log.exception(e)
-        take_screenshot(page, "99_error")
-        wxpush(f"❌ Gaming4Free 续期异常: {e}")
-    finally:
-        time.sleep(3)
-        browser.close()
+        print(
+            f"❌ 代理 IP 检查失败: {e}",
+            file=sys.stderr
+        )
 
-    # 推送结果
-    # 转换为北京时间
-    now_bj = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
-    now_str = now_bj.strftime("%Y-%m-%d %H:%M:%S")
+    # ===== 并行投票 =====
+    results = [None] * len(SERVERS)
 
-    if success:
-        lines = [
-            f"✅ Gaming4Free 续期成功",
-            f"执行时间: {now_str} (北京时间)",
+    def run_task(index, server):
+        print(
+            f"\n=== {server['name']} ===",
+            file=sys.stderr
+        )
+        ok, msg, tl = renew_server(
+            server["url"],
+            server["name"]
+        )
+        return index, ok, msg, tl
+
+    with ThreadPoolExecutor(max_workers=len(SERVERS)) as executor:
+        futures = [
+            executor.submit(run_task, i, s)
+            for i, s in enumerate(SERVERS)
         ]
-        if before_remain:
-            lines.append(f"续期前剩余: {before_remain}")
-        if after_remain:
-            lines.append(f"续期后剩余: {after_remain}")
-        if before_expiry:
-            lines.append(f"原到期: {before_expiry}")
-        if after_expiry:
-            lines.append(f"新到期: {after_expiry}")
-        log.info("\n".join(lines))
-        # 成功不推送
-    else:
-        lines = [
-            f"❌ Gaming4Free 续期失败（请查看截图）",
-            f"执行时间: {now_str} (北京时间)",
-        ]
-        if before_expiry:
-            lines.append(f"到期: {before_expiry}")
-        msg = "\n".join(lines)
-        log.info(msg)
-        wxpush(msg)
+
+        for future in as_completed(futures):
+            index, ok, msg, tl = future.result()
+            results[index] = (ok, msg, tl)
+
+    print("\n" + "=" * 30)
+    print("📊 G4F 服务器续期报告")
+
+    for _, msg, _ in results:
+        print(f"  {msg}")
+
 
 if __name__ == "__main__":
     main()
