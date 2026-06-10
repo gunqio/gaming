@@ -10,8 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from cloakbrowser import launch
 
 SERVERS = [
-    {"url": "https://g4f.gg/deku", "name": "Deku"},
-    {"url": "https://g4f.gg/rena", "name": "Rena"},
+    {"url": "https://g4f.gg/laobao", "name": "laobao"},    
 ]
 
 
